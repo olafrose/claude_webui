@@ -1,0 +1,23 @@
+{
+  "name": "claude-remote",
+  "version": "0.1.0",
+  "description": "Self-hosted mobile web UI for Claude Code sessions on this machine",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server/index.js",
+    "dev": "node --env-file-if-exists=.env --watch server/index.js",
+    "totp-setup": "node scripts/totp-setup.js"
+  },
+  "type": "module",
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.283",
+    "dompurify": "^3.4.16",
+    "express": "^5.2.1",
+    "marked": "^18.0.14",
+    "ws": "^8.22.0"
+  },
+  "private": true,
+  "engines": {
+    "node": ">=22.9"
+  }
+}
