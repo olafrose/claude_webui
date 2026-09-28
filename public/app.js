@@ -134,17 +134,27 @@ document.addEventListener('visibilitychange', () => {
   if (!document.hidden && ws.started && !ws.open && ws.sock?.readyState === WebSocket.CLOSED) ws.connect();
 });
 
-const globalState = { live: [], viewingSession: null, config: null };
+const globalState = { machines: [], live: {}, viewingSession: null, config: null };
+
+const machineById = (id) => globalState.machines.find((m) => m.id === id);
+/** Machine name for labels; empty when only one machine exists (unless `always`). */
+function machineLabel(id, always = false) {
+  if (!always && globalState.machines.length <= 1) return '';
+  return machineById(id)?.name || id;
+}
+const sessionUrl = (machineId, sessionId, cwd) => `#/m/${machineId}/s/${sessionId}?cwd=${encodeURIComponent(cwd || '')}`;
 
 ws.on((msg) => {
-  if (msg.t === 'live') globalState.live = msg.sessions;
+  if (msg.t === 'machines') globalState.machines = msg.machines;
+  if (msg.t === 'live') globalState.live[msg.machineId] = msg.sessions;
   if (msg.t === 'attention') {
-    const viewing = globalState.viewingSession === msg.sessionId && !document.hidden;
+    const viewing = globalState.viewingSession === `${msg.machineId}/${msg.sessionId}` && !document.hidden;
     if (viewing) return;
-    const url = `/#/s/${msg.sessionId}`;
+    const hash = sessionUrl(msg.machineId, msg.sessionId, '');
     const title = msg.kind === 'permission' ? 'Claude needs approval' : 'Claude is waiting';
-    toast(`${title}: ${msg.title || msg.text}`, { onclick: () => (location.hash = `#/s/${msg.sessionId}`), timeout: 8000 });
-    if (document.hidden) notify(title, `${msg.title ? msg.title + ' — ' : ''}${msg.text}`, url);
+    const where = globalState.machines.length > 1 && msg.machineName ? ` (${msg.machineName})` : '';
+    toast(`${title}${where}: ${msg.title || msg.text}`, { onclick: () => (location.hash = hash), timeout: 8000 });
+    if (document.hidden) notify(title + where, `${msg.title ? msg.title + ' — ' : ''}${msg.text}`, `/${hash}`);
   }
 });
 
@@ -158,8 +168,10 @@ function route() {
   const hash = location.hash.slice(1) || '/';
   const [path, qs] = hash.split('?');
   const params = new URLSearchParams(qs || '');
-  const m = path.match(/^\/s\/([\w-]+)/);
-  cleanup = m ? sessionView(m[1], params.get('cwd')) : dashboardView();
+  const m = path.match(/^\/m\/([\w-]+)\/s\/([\w-]+)/);
+  if (m) cleanup = sessionView(m[1], m[2], params.get('cwd'));
+  else if (path === '/machines') cleanup = machinesView();
+  else cleanup = dashboardView();
 }
 window.addEventListener('hashchange', () => authed && route());
 
@@ -168,7 +180,9 @@ async function boot() {
   const me = await fetch('/api/me').then((r) => r.json());
   if (!me.authenticated) return showLogin(me.totp);
   authed = true;
-  globalState.config = await api('/api/config');
+  const [config, { machines }] = await Promise.all([api('/api/config'), api('/api/machines')]);
+  globalState.config = config;
+  globalState.machines = machines;
   ws.start();
   route();
 }
@@ -209,61 +223,55 @@ function showLogin(totp) {
 
 // ---------------------------------------------------------------- dashboard
 
+function statusDot(status) {
+  return h('span', { class: `dot ${status || ''}`, title: STATUS_TEXT[status] || status || '' });
+}
+
 function dashboardView() {
   document.title = 'Claude Remote';
   const openProjects = new Set(store.get('openProjects', []));
-  let data = null;
-  let live = { app: [], external: [] };
+  const projectsByMachine = new Map(); // machineId -> { projects } | { error }
+  let live = [];
   let filter = '';
   const showAll = new Set();
 
   const activeBox = h('div');
-  const listBox = h('div', { class: 'card list' }, h('div', { class: 'empty' }, h('span', { class: 'spinner' })));
+  const machinesBox = h('div', {}, h('div', { class: 'empty' }, h('span', { class: 'spinner' })));
 
   const notifBtn = 'Notification' in window && Notification.permission === 'default'
     ? h('button', { class: 'icon-btn', title: 'Enable notifications', html: icons.bell, onclick: async () => { await Notification.requestPermission(); notifBtn.remove(); } })
     : null;
 
-  const search = h('input', { class: 'input', type: 'search', placeholder: 'Filter projects…', oninput: () => { filter = search.value.toLowerCase(); renderList(); } });
+  const search = h('input', { class: 'input', type: 'search', placeholder: 'Filter projects…', oninput: () => { filter = search.value.toLowerCase(); render(); } });
 
   app.replaceChildren(
     h('div', { class: 'topbar' },
       h('div', { class: 'title brand' }, h('img', { src: '/icon.svg', alt: '' }), h('h1', {}, 'Claude Remote')),
       notifBtn,
+      h('a', { class: 'icon-btn', title: 'Machines', href: '#/machines', html: icons.computer }),
       h('button', { class: 'icon-btn', title: 'Refresh', html: icons.refresh, onclick: () => load() }),
       h('button', { class: 'icon-btn', title: 'Sign out', html: icons.logout, onclick: async () => { await api('/api/logout', { method: 'POST' }); location.reload(); } })),
-    h('div', { class: 'page' },
-      activeBox,
-      h('div', { class: 'section-title' }, 'Projects', h('span', { class: 'spacer' }), h('span', { style: 'text-transform:none;font-weight:400', title: globalState.config?.baseDir }, basename(globalState.config?.baseDir))),
-      h('div', { class: 'search' }, search, h('button', { class: 'btn', onclick: newFolder }, iconEl('plus'), 'Folder')),
-      h('div', { style: 'height:10px' }),
-      listBox));
-
-  function statusDot(status) {
-    return h('span', { class: `dot ${status || ''}`, title: STATUS_TEXT[status] || status || '' });
-  }
+    h('div', { class: 'page' }, activeBox, h('div', { class: 'search' }, search), machinesBox));
 
   function renderActive() {
-    const items = [
-      ...live.app.map((s) => ({ ...s, where: 'here' })),
-      ...live.external.map((s) => ({ ...s, title: s.name, where: s.entrypoint?.replace(/^claude-/, '') || 'terminal' })),
-    ];
-    if (!items.length) return activeBox.replaceChildren();
+    if (!live.length) return activeBox.replaceChildren();
     activeBox.replaceChildren(
       h('div', { class: 'section-title' }, 'Active now'),
-      h('div', { class: 'card list' }, items.map((s) =>
-        h('a', { class: 'row', href: `#/s/${s.sessionId}?cwd=${encodeURIComponent(s.cwd || '')}` },
+      h('div', { class: 'card list' }, live.map((s) =>
+        h('a', { class: 'row', href: sessionUrl(s.machineId, s.sessionId, s.cwd) },
           statusDot(s.pending ? 'requires_action' : s.status),
           h('div', { class: 'main' },
             h('div', { class: 'name' }, s.title || 'New session'),
-            h('div', { class: 'meta' }, h('span', {}, basename(s.cwd)), '·', h('span', {}, s.pending ? 'Needs approval' : STATUS_TEXT[s.status] || s.status),
-              s.where !== 'here' ? h('span', { class: 'badge' }, s.where) : null,
+            h('div', { class: 'meta' },
+              machineLabel(s.machineId) && h('span', { class: 'badge' }, machineLabel(s.machineId)),
+              h('span', {}, basename(s.cwd)), '·', h('span', {}, s.pending ? 'Needs approval' : STATUS_TEXT[s.status] || s.status),
+              s.where !== 'here' ? h('span', { class: 'badge warn' }, s.where) : null,
               s.runningAgents ? h('span', { class: 'badge accent' }, `${s.runningAgents} agent${s.runningAgents > 1 ? 's' : ''}`) : null)),
           h('span', { class: 'chev', html: icons.chev })))));
   }
 
-  function sessionRow(s) {
-    return h('a', { class: 'row', href: `#/s/${s.sessionId}?cwd=${encodeURIComponent(s.cwd || '')}` },
+  function sessionRow(machine, s) {
+    return h('a', { class: 'row', href: sessionUrl(machine.id, s.sessionId, s.cwd) },
       s.live ? statusDot(s.status) : null,
       h('div', { class: 'main' },
         h('div', { class: 'name' }, s.title),
@@ -273,53 +281,83 @@ function dashboardView() {
       h('span', { class: 'chev', html: icons.chev }));
   }
 
-  function renderList() {
-    if (!data) return;
-    const projects = data.projects.filter((p) => !filter || p.name.toLowerCase().includes(filter));
-    if (!projects.length) return listBox.replaceChildren(h('div', { class: 'empty' }, filter ? 'No matching folders' : 'No folders in the base directory yet'));
-    listBox.replaceChildren(...projects.map((p) => {
-      const open = openProjects.has(p.path);
-      const toggle = () => {
-        open ? openProjects.delete(p.path) : openProjects.add(p.path);
-        store.set('openProjects', [...openProjects]);
-        renderList();
-      };
-      const limit = showAll.has(p.path) ? Infinity : 6;
-      return h('div', { class: `project${open ? ' open' : ''}` },
-        h('div', { class: 'row', onclick: toggle },
-          h('div', { class: 'main' },
-            h('div', { class: 'name' }, p.name),
-            h('div', { class: 'meta' },
-              p.sessionCount ? `${p.sessionCount} session${p.sessionCount > 1 ? 's' : ''} · ${relTime(p.lastActivity)}` : 'No sessions yet',
-              p.liveCount ? h('span', { class: 'badge accent' }, h('span', { class: 'dot running' }), `${p.liveCount} live`) : null)),
-          h('span', { class: 'chev', html: icons.chev })),
-        open && h('div', { class: 'sessions' },
-          h('div', { class: 'actions' }, h('button', { class: 'btn primary small', onclick: () => newSession(p) }, iconEl('plus'), 'New session')),
-          h('div', { class: 'list' }, p.sessions.slice(0, limit).map(sessionRow)),
-          p.sessions.length > limit && h('div', { class: 'actions' }, h('button', { class: 'btn small ghost', onclick: () => { showAll.add(p.path); renderList(); } }, `Show ${p.sessions.length - limit} more`))));
+  function projectCard(machine, p) {
+    const key = `${machine.id}:${p.path}`;
+    const open = openProjects.has(key);
+    const toggle = () => {
+      open ? openProjects.delete(key) : openProjects.add(key);
+      store.set('openProjects', [...openProjects]);
+      render();
+    };
+    const limit = showAll.has(key) ? Infinity : 6;
+    return h('div', { class: `project${open ? ' open' : ''}` },
+      h('div', { class: 'row', onclick: toggle },
+        h('div', { class: 'main' },
+          h('div', { class: 'name' }, p.name),
+          h('div', { class: 'meta' },
+            p.sessionCount ? `${p.sessionCount} session${p.sessionCount > 1 ? 's' : ''} · ${relTime(p.lastActivity)}` : 'No sessions yet',
+            p.liveCount ? h('span', { class: 'badge accent' }, h('span', { class: 'dot running' }), `${p.liveCount} live`) : null)),
+        h('span', { class: 'chev', html: icons.chev })),
+      open && h('div', { class: 'sessions' },
+        h('div', { class: 'actions' }, h('button', { class: 'btn primary small', onclick: () => newSession(machine, p) }, iconEl('plus'), 'New session')),
+        h('div', { class: 'list' }, p.sessions.slice(0, limit).map((s) => sessionRow(machine, s))),
+        p.sessions.length > limit && h('div', { class: 'actions' }, h('button', { class: 'btn small ghost', onclick: () => { showAll.add(key); render(); } }, `Show ${p.sessions.length - limit} more`))));
+  }
+
+  function render() {
+    renderActive();
+    const machines = globalState.machines;
+    if (!machines.length) {
+      return machinesBox.replaceChildren(h('div', { class: 'card', style: 'margin-top:16px' },
+        h('div', { class: 'empty' }, h('p', { style: 'margin-top:0' }, 'No machines connected yet.'), h('a', { class: 'btn primary', href: '#/machines' }, iconEl('plus'), 'Add a machine'))));
+    }
+    machinesBox.replaceChildren(...machines.map((m) => {
+      const data = projectsByMachine.get(m.id);
+      const header = h('div', { class: 'section-title' },
+        h('span', { class: `dot ${m.online ? 'idle' : ''}` }),
+        h('span', { style: 'text-transform:none;font-size:14px;color:var(--text)' }, m.name),
+        m.online && m.baseDir ? h('span', { style: 'text-transform:none;font-weight:400', title: m.baseDir }, basename(m.baseDir)) : null,
+        h('span', { class: 'spacer' }),
+        m.online && h('button', { class: 'btn small ghost', onclick: () => newFolder(m) }, iconEl('plus'), 'Folder'));
+      let body;
+      if (!m.online) body = h('div', { class: 'card' }, h('div', { class: 'empty' }, `Offline${m.lastSeen ? ` · last seen ${relTime(m.lastSeen)}` : ' · never connected'}`));
+      else if (!data) body = h('div', { class: 'card' }, h('div', { class: 'empty' }, h('span', { class: 'spinner' })));
+      else if (data.error) body = h('div', { class: 'card' }, h('div', { class: 'empty' }, `Failed to load: ${data.error}`));
+      else {
+        const projects = data.projects.filter((p) => !filter || p.name.toLowerCase().includes(filter));
+        body = h('div', { class: 'card list' }, projects.length
+          ? projects.map((p) => projectCard(m, p))
+          : h('div', { class: 'empty' }, filter ? 'No matching folders' : 'No folders in the base directory yet'));
+      }
+      return h('div', {}, header, body);
     }));
   }
 
+  let loading = false;
   async function load() {
+    if (loading) return;
+    loading = true;
     try {
-      const [projects, liveNow] = await Promise.all([api('/api/projects'), api('/api/live')]);
-      data = projects;
-      live = liveNow;
-      renderActive();
-      renderList();
-    } catch (e) {
-      listBox.replaceChildren(h('div', { class: 'empty' }, `Failed to load: ${e.message}`));
+      const [liveNow] = await Promise.all([
+        api('/api/live').catch(() => ({ sessions: [] })),
+        ...globalState.machines.filter((m) => m.online).map((m) =>
+          api(`/api/m/${m.id}/projects`).then((r) => projectsByMachine.set(m.id, r), (e) => projectsByMachine.set(m.id, { error: e.message }))),
+      ]);
+      live = liveNow.sessions;
+      render();
+    } finally {
+      loading = false;
     }
   }
 
-  function newFolder() {
+  function newFolder(machine) {
     const name = h('input', { class: 'input', placeholder: 'my-new-project', autocapitalize: 'off', autocorrect: 'off' });
-    const s = sheet('New folder', h('form', {
+    const s = sheet(`New folder on ${machine.name}`, h('form', {
       onsubmit: async (e) => {
         e.preventDefault();
         try {
-          const { path } = await api('/api/projects', { method: 'POST', body: { name: name.value.trim() } });
-          openProjects.add(path);
+          const { path } = await api(`/api/m/${machine.id}/projects`, { method: 'POST', body: { name: name.value.trim() } });
+          openProjects.add(`${machine.id}:${path}`);
           store.set('openProjects', [...openProjects]);
           s.close();
           load();
@@ -327,18 +365,159 @@ function dashboardView() {
           toast(ex.message, { error: true });
         }
       },
-    }, h('div', { class: 'field' }, h('label', {}, `Created inside ${globalState.config.baseDir}`), name), h('div', { class: 'btns' }, h('button', { class: 'btn primary', type: 'submit' }, 'Create'))));
+    }, h('div', { class: 'field' }, h('label', {}, `Created inside ${machine.baseDir}`), name), h('div', { class: 'btns' }, h('button', { class: 'btn primary', type: 'submit' }, 'Create'))));
     name.focus();
   }
 
-  const unsub = ws.on((msg) => { if (msg.t === 'live') load(); });
+  let reloadTimer;
+  const unsub = ws.on((msg) => {
+    if (msg.t === 'machines' || msg.t === 'live') {
+      render();
+      clearTimeout(reloadTimer);
+      reloadTimer = setTimeout(load, 300);
+    }
+  });
+  render();
   load();
   const timer = setInterval(() => !document.hidden && load(), 10_000);
-  return () => { clearInterval(timer); unsub(); };
+  return () => { clearInterval(timer); clearTimeout(reloadTimer); unsub(); };
 }
 
-function modeSelect(value, onchange) {
-  const modes = globalState.config?.permissionModes || ['default'];
+// ---------------------------------------------------------------- machines
+
+function machinesView() {
+  document.title = 'Machines · Claude Remote';
+  const listBox = h('div', { class: 'card list' });
+  const confirming = new Set();
+
+  app.replaceChildren(
+    h('div', { class: 'topbar' },
+      h('button', { class: 'icon-btn', title: 'Back', html: icons.back, onclick: () => (location.hash = '#/') }),
+      h('div', { class: 'title' }, h('h1', {}, 'Machines')),
+      h('button', { class: 'btn primary small', onclick: addMachine }, iconEl('plus'), 'Add')),
+    h('div', { class: 'page' },
+      h('p', { style: 'color:var(--muted);font-size:14px' }, 'Each PC runs a small agent that connects out to this hub, so the PCs need no open ports. Add a machine to get its token.'),
+      listBox));
+
+  function render() {
+    const machines = globalState.machines;
+    if (!machines.length) return listBox.replaceChildren(h('div', { class: 'empty' }, 'No machines yet.'));
+    listBox.replaceChildren(...machines.map((m) => h('div', { class: 'row', style: 'cursor:default;align-items:flex-start' },
+      h('span', { class: `dot ${m.online ? 'idle' : ''}`, style: 'margin-top:8px' }),
+      h('div', { class: 'main' },
+        h('div', { class: 'name' }, m.name, m.embedded ? h('span', { class: 'badge', style: 'margin-left:6px' }, 'this server') : null),
+        h('div', { class: 'meta', style: 'white-space:normal;flex-wrap:wrap' },
+          m.online ? 'Online' : m.lastSeen ? `Offline · last seen ${relTime(m.lastSeen)}` : 'Never connected',
+          m.hostname && h('span', {}, `· ${m.hostname}`),
+          m.platform && h('span', {}, `· ${m.platform}`),
+          m.liveCount ? h('span', { class: 'badge accent' }, `${m.liveCount} live`) : null),
+        m.baseDir && h('div', { class: 'meta' }, m.baseDir)),
+      !m.embedded && h('div', { style: 'display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end' },
+        h('button', { class: 'btn small', onclick: () => rename(m) }, 'Rename'),
+        h('button', { class: 'btn small danger', onclick: () => revoke(m) }, confirming.has(m.id) ? 'Confirm revoke' : 'Revoke')))));
+  }
+
+  async function refresh() {
+    try {
+      globalState.machines = (await api('/api/machines')).machines;
+    } catch (e) {
+      toast(e.message, { error: true });
+    }
+    render();
+  }
+
+  async function revoke(m) {
+    if (!confirming.has(m.id)) {
+      confirming.add(m.id);
+      render();
+      setTimeout(() => { confirming.delete(m.id); render(); }, 5000);
+      return;
+    }
+    try {
+      await api(`/api/machines/${m.id}`, { method: 'DELETE' });
+      toast(`${m.name} revoked`);
+      refresh();
+    } catch (e) {
+      toast(e.message, { error: true });
+    }
+  }
+
+  function rename(m) {
+    const name = h('input', { class: 'input', value: m.name });
+    const s = sheet('Rename machine', h('form', {
+      onsubmit: async (e) => {
+        e.preventDefault();
+        try {
+          await api(`/api/machines/${m.id}`, { method: 'PATCH', body: { name: name.value } });
+          s.close();
+          refresh();
+        } catch (ex) {
+          toast(ex.message, { error: true });
+        }
+      },
+    }, h('div', { class: 'field' }, name), h('div', { class: 'btns' }, h('button', { class: 'btn primary', type: 'submit' }, 'Save'))));
+    name.focus();
+  }
+
+  function addMachine() {
+    const name = h('input', { class: 'input', placeholder: 'e.g. Desktop, Work laptop' });
+    const body = h('div');
+    const s = sheet('Add machine', body);
+    body.replaceChildren(h('form', {
+      onsubmit: async (e) => {
+        e.preventDefault();
+        try {
+          const { token } = await api('/api/machines', { method: 'POST', body: { name: name.value } });
+          showSetup(token);
+          refresh();
+        } catch (ex) {
+          toast(ex.message, { error: true });
+        }
+      },
+    }, h('div', { class: 'field' }, h('label', {}, 'Name'), name), h('div', { class: 'btns' }, h('button', { class: 'btn primary', type: 'submit' }, 'Create token'))));
+    name.focus();
+
+    function showSetup(token) {
+      const hub = globalState.config?.publicUrl || location.origin;
+      const envText = `HUB_URL=${hub}\nAGENT_TOKEN=${token}\nBASE_DIR=C:\\Users\\<you>\\source\\repos`;
+      const pre = h('pre', { class: 'code-block' }, envText);
+      body.replaceChildren(
+        h('div', { class: 'banner warn', style: 'margin:0 0 12px' }, 'Copy the token now. It is shown only once.'),
+        h('ol', { class: 'steps' },
+          h('li', {}, 'On the PC: install Node.js 22+ and Claude Code, and sign in to Claude once (', h('code', {}, 'claude'), ').'),
+          h('li', {}, 'Copy this project to the PC and run ', h('code', {}, 'npm install'), '.'),
+          h('li', {}, 'Create a ', h('code', {}, '.env'), ' file next to ', h('code', {}, 'package.json'), ':', pre),
+          h('li', {}, 'Start the agent: ', h('code', {}, 'npm run agent'))),
+        h('div', { class: 'btns' },
+          h('button', { class: 'btn', onclick: () => copyText(envText, pre) }, 'Copy .env'),
+          h('button', { class: 'btn primary', onclick: () => s.close() }, 'Done')));
+    }
+  }
+
+  const unsub = ws.on((msg) => msg.t === 'machines' && render());
+  render();
+  refresh();
+  return unsub;
+}
+
+function copyText(text, fallbackEl) {
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(() => toast('Copied'), () => selectEl(fallbackEl));
+  } else {
+    selectEl(fallbackEl);
+    toast('Selected: copy it manually');
+  }
+}
+function selectEl(el) {
+  const r = document.createRange();
+  r.selectNodeContents(el);
+  const sel = getSelection();
+  sel.removeAllRanges();
+  sel.addRange(r);
+}
+
+function modeSelect(machine, value, onchange) {
+  const modes = machine?.permissionModes || ['default'];
   const labels = { default: 'Ask', acceptEdits: 'Accept edits', plan: 'Plan', auto: 'Auto', dontAsk: "Don't ask", bypassPermissions: 'Bypass ⚠' };
   const sel = h('select', { class: 'input', title: 'Permission mode', onchange: () => onchange?.(sel.value) }, modes.map((m) => h('option', { value: m, selected: m === value }, labels[m] || m)));
   return sel;
@@ -349,21 +528,22 @@ function modelSelect(value = '') {
   return h('select', { class: 'input' }, models.map(([v, l]) => h('option', { value: v, selected: v === value }, l)));
 }
 
-function newSession(project) {
+function newSession(machine, project) {
   const prompt = h('textarea', { class: 'input', rows: 4, placeholder: 'What should Claude work on? (optional)' });
-  const mode = modeSelect(store.get('lastMode', globalState.config.defaultPermissionMode));
+  const mode = modeSelect(machine, store.get('lastMode', machine.defaultPermissionMode || 'default'));
   const model = modelSelect(store.get('lastModel', ''));
   const btn = h('button', { class: 'btn primary', type: 'submit' }, 'Start session');
-  const s = sheet(`New session · ${project.name}`, h('form', {
+  const title = machineLabel(machine.id) ? `New session · ${machine.name} / ${project.name}` : `New session · ${project.name}`;
+  const s = sheet(title, h('form', {
     onsubmit: async (e) => {
       e.preventDefault();
       btn.disabled = true;
       store.set('lastMode', mode.value);
       store.set('lastModel', model.value);
       try {
-        const { sessionId } = await api('/api/sessions', { method: 'POST', body: { cwd: project.path, prompt: prompt.value.trim(), permissionMode: mode.value, model: model.value } });
+        const { sessionId } = await api(`/api/m/${machine.id}/sessions`, { method: 'POST', body: { cwd: project.path, prompt: prompt.value.trim(), permissionMode: mode.value, model: model.value } });
         s.close();
-        location.hash = `#/s/${sessionId}?cwd=${encodeURIComponent(project.path)}`;
+        location.hash = sessionUrl(machine.id, sessionId, project.path);
       } catch (ex) {
         toast(ex.message, { error: true });
         btn.disabled = false;
@@ -380,8 +560,11 @@ function newSession(project) {
 
 // ---------------------------------------------------------------- session view
 
-function sessionView(id, cwdParam) {
-  globalState.viewingSession = id;
+function sessionView(mid, id, cwdParam) {
+  globalState.viewingSession = `${mid}/${id}`;
+  const base = `/api/m/${mid}`;
+  const wsSend = (m) => ws.send({ ...m, machineId: mid });
+  const sessionHash = (sid, cwd) => `#/m/${mid}/s/${sid}?cwd=${encodeURIComponent(cwd || "")}`;
   const S = {
     mode: 'loading', // live | stored | external
     meta: null,
@@ -463,7 +646,7 @@ function sessionView(id, cwdParam) {
     document.title = `${title} · Claude Remote`;
     const status = S.pending.size ? 'requires_action' : S.status;
     const where = S.mode === 'external' ? `open in ${S.external?.entrypoint?.replace(/^claude-/, '') || 'terminal'}` : S.mode === 'stored' ? 'not running' : STATUS_TEXT[status] || status || '';
-    subEl.replaceChildren(h('span', { class: `dot ${S.mode === 'stored' ? '' : status || ''}` }), h('span', {}, basename(S.cwd || S.meta?.cwd)), '·', h('span', {}, where));
+    subEl.replaceChildren(h('span', { class: `dot ${S.mode === 'stored' ? '' : status || ''}` }), machineLabel(mid) && h('span', {}, machineLabel(mid)), machineLabel(mid) && '·', h('span', {}, basename(S.cwd || S.meta?.cwd)), '·', h('span', {}, S.mode === 'offline' ? 'machine offline' : where));
 
     statusDot.className = `dot ${S.mode === 'stored' ? '' : status || ''}`;
     statusText.textContent = S.mode === 'live' ? STATUS_TEXT[status] || status || '' : S.mode === 'external' ? `Running in ${S.external?.entrypoint || 'another process'} (${S.external?.status || '?'}) — watching` : S.mode === 'stored' ? 'Not running — sending resumes it' : '';
@@ -478,11 +661,12 @@ function sessionView(id, cwdParam) {
   }
 
   function renderModeSelect() {
-    const current = S.meta?.permissionMode || store.get('lastMode', globalState.config.defaultPermissionMode);
-    const sel = modeSelect(current, async (mode) => {
+    const m = machineById(mid);
+    const current = S.meta?.permissionMode || store.get('lastMode', m?.defaultPermissionMode || 'default');
+    const sel = modeSelect(m, current, async (mode) => {
       store.set('lastMode', mode);
       if (isLive()) {
-        try { await ws.send({ t: 'mode', sessionId: id, mode }); } catch (e) { toast(e.message, { error: true }); }
+        try { await wsSend({ t: 'mode', sessionId: id, mode }); } catch (e) { toast(e.message, { error: true }); }
       }
     });
     sel.className = '';
@@ -535,7 +719,7 @@ function sessionView(id, cwdParam) {
       body.replaceChildren(h('div', { class: 'empty' }, h('span', { class: 'spinner' })));
       const derived = deriveAgents();
       try {
-        const { agents } = await api(`/api/sessions/${id}/agents?cwd=${encodeURIComponent(S.cwd)}`);
+        const { agents } = await api(`${base}/sessions/${id}/agents?cwd=${encodeURIComponent(S.cwd)}`);
         if (!agents.length && !derived.length) return body.replaceChildren(h('div', { class: 'empty' }, 'This session has not spawned any agents.'));
         body.replaceChildren(
           ...derived.map((a) => h('div', { class: 'agent-item', onclick: () => openStoredAgent(agentIdFromResult(a.result), a) },
@@ -558,7 +742,7 @@ function sessionView(id, cwdParam) {
       }
       body.replaceChildren(h('div', { class: 'empty' }, h('span', { class: 'spinner' })));
       try {
-        const { entries } = await api(`/api/sessions/${id}/agents/${agentId}?cwd=${encodeURIComponent(S.cwd)}`);
+        const { entries } = await api(`${base}/sessions/${id}/agents/${agentId}?cwd=${encodeURIComponent(S.cwd)}`);
         const box = h('div', { class: 'agent-feed' });
         const f = new Feed(box, { filter: () => true });
         f.add(entries.map((e) => (e.kind === 'user' ? { ...e, kind: 'prompt' } : e)));
@@ -605,7 +789,7 @@ function sessionView(id, cwdParam) {
               h('div', { class: 'name' }, a.description, h('span', { class: 'badge' }, a.status)),
               h('div', { class: 'meta' }, agentMeta(a)),
               a.task?.summary && h('div', { class: 'summary' }, a.task.summary)),
-            a.status === 'running' && a.task && h('button', { class: 'btn small danger', onclick: () => ws.send({ t: 'stop_task', sessionId: id, taskId: a.task.taskId }).catch((e) => toast(e.message, { error: true })) }, 'Stop')));
+            a.status === 'running' && a.task && h('button', { class: 'btn small danger', onclick: () => wsSend({ t: 'stop_task', sessionId: id, taskId: a.task.taskId }).catch((e) => toast(e.message, { error: true })) }, 'Stop')));
         detailView.footer.replaceChildren(
           box.childElementCount ? '' : h('div', { class: 'empty' }, a.status === 'running' ? 'Waiting for activity…' : 'No activity recorded in this view.'),
           // The final report is already in the feed when subagent text was forwarded.
@@ -645,7 +829,7 @@ function sessionView(id, cwdParam) {
   }
 
   function decide(req, decision, extra = {}) {
-    return ws.send({ t: 'permission', sessionId: id, id: req.id, decision, ...extra }).catch((e) => toast(e.message, { error: true }));
+    return wsSend({ t: 'permission', sessionId: id, id: req.id, decision, ...extra }).catch((e) => toast(e.message, { error: true }));
   }
 
   function permissionCard(req) {
@@ -709,13 +893,13 @@ function sessionView(id, cwdParam) {
     if (menuEl) return closeMenu();
     const item = (label, fn) => h('button', { onclick: () => { closeMenu(); fn(); } }, label);
     menuEl = h('div', { class: 'menu' },
-      isLive() && item('Interrupt Claude', () => ws.send({ t: 'interrupt', sessionId: id })),
+      isLive() && item('Interrupt Claude', () => wsSend({ t: 'interrupt', sessionId: id })),
       isLive() && item('Change model…', changeModel),
       item('Fork into new session…', () => forkSession()),
       item('Copy session ID', () => navigator.clipboard?.writeText(id).then(() => toast('Copied'))),
       isLive() && h('hr'),
       isLive() && item('Close session', async () => {
-        await api(`/api/sessions/${id}/close`, { method: 'POST' }).catch((e) => toast(e.message, { error: true }));
+        await api(`${base}/sessions/${id}/close`, { method: 'POST' }).catch((e) => toast(e.message, { error: true }));
       }));
     app.querySelector('.session').append(menuEl);
     setTimeout(() => document.addEventListener('click', closeMenu, { once: true }));
@@ -729,7 +913,7 @@ function sessionView(id, cwdParam) {
     const sel = modelSelect('');
     const s = sheet('Change model', h('div', {}, h('div', { class: 'field' }, h('label', {}, `Current: ${S.meta?.model || 'default'}`), sel),
       h('div', { class: 'btns' }, h('button', { class: 'btn primary', onclick: async () => {
-        try { await ws.send({ t: 'model', sessionId: id, model: sel.value }); s.close(); } catch (e) { toast(e.message, { error: true }); }
+        try { await wsSend({ t: 'model', sessionId: id, model: sel.value }); s.close(); } catch (e) { toast(e.message, { error: true }); }
       } }, 'Switch'))));
   }
 
@@ -739,9 +923,9 @@ function sessionView(id, cwdParam) {
       onsubmit: async (e) => {
         e.preventDefault();
         try {
-          const { sessionId } = await api('/api/sessions', { method: 'POST', body: { cwd: S.cwd, resume: id, fork: true, prompt: prompt.value.trim(), permissionMode: S.modeSel?.value } });
+          const { sessionId } = await api(`${base}/sessions`, { method: 'POST', body: { cwd: S.cwd, resume: id, fork: true, prompt: prompt.value.trim(), permissionMode: S.modeSel?.value } });
           s.close();
-          location.hash = `#/s/${sessionId}?cwd=${encodeURIComponent(S.cwd)}`;
+          location.hash = sessionHash(sessionId, S.cwd);
         } catch (ex) {
           toast(ex.message, { error: true });
         }
@@ -802,7 +986,7 @@ function sessionView(id, cwdParam) {
   }
 
   function onSendClick() {
-    if (sendBtn.classList.contains('stop')) return ws.send({ t: 'interrupt', sessionId: id }).catch((e) => toast(e.message, { error: true }));
+    if (sendBtn.classList.contains('stop')) return wsSend({ t: 'interrupt', sessionId: id }).catch((e) => toast(e.message, { error: true }));
     doSend();
   }
 
@@ -814,10 +998,10 @@ function sessionView(id, cwdParam) {
     sendBtn.disabled = true;
     try {
       if (isLive()) {
-        await ws.send({ t: 'send', sessionId: id, text, images });
+        await wsSend({ t: 'send', sessionId: id, text, images });
       } else {
         // Resume the stored session in this server, then subscribe to it.
-        await api('/api/sessions', { method: 'POST', body: { cwd: S.cwd, resume: id, prompt: text, images, permissionMode: S.modeSel?.value } });
+        await api(`${base}/sessions`, { method: 'POST', body: { cwd: S.cwd, resume: id, prompt: text, images, permissionMode: S.modeSel?.value } });
         subscribe();
       }
       textarea.value = '';
@@ -849,12 +1033,12 @@ function sessionView(id, cwdParam) {
   }
 
   function subscribe() {
-    if (ws.open) ws.sock.send(JSON.stringify({ t: 'subscribe', sessionId: id }));
+    if (ws.open) ws.sock.send(JSON.stringify({ t: 'subscribe', machineId: mid, sessionId: id }));
   }
 
   async function loadStored() {
     try {
-      const res = await api(`/api/sessions/${id}/history?cwd=${encodeURIComponent(S.cwd)}`);
+      const res = await api(`${base}/sessions/${id}/history?cwd=${encodeURIComponent(S.cwd)}`);
       if (disposed || S.mode === 'live') return;
       S.cwd = S.cwd || res.cwd || '';
       S.title = res.title || S.title;
@@ -900,7 +1084,7 @@ function sessionView(id, cwdParam) {
     if (disposed || S.mode !== 'external') return;
     if (document.hidden) { pollTimer = setTimeout(pollExternal, 5000); return; }
     try {
-      const res = await api(`/api/sessions/${id}/history?cwd=${encodeURIComponent(S.cwd)}&offset=${S.historyTotal}`);
+      const res = await api(`${base}/sessions/${id}/history?cwd=${encodeURIComponent(S.cwd)}&offset=${S.historyTotal}`);
       if (disposed || S.mode !== 'external') return;
       if (res.reset) return loadStored();
       S.historyTotal = res.total;
@@ -916,13 +1100,20 @@ function sessionView(id, cwdParam) {
     if (msg.t === '_open') return subscribe();
     if (msg.t === 'live') {
       // Someone (maybe another tab) started this session while we were viewing it read-only.
-      if (S.mode !== 'live' && msg.sessions.some((s) => s.sessionId === id)) subscribe();
+      if (msg.machineId === mid && S.mode !== 'live' && msg.sessions.some((s) => s.sessionId === id)) subscribe();
       return;
     }
-    if (msg.sessionId !== id) return;
+    if (msg.sessionId !== id || msg.machineId !== mid) return;
     switch (msg.t) {
+      case 'machine_offline':
+        // The hub re-sends a snapshot (or not_live) once the machine reconnects.
+        clearTimeout(pollTimer);
+        S.mode = 'offline';
+        bannerWrap.replaceChildren(h('div', { class: 'banner warn' }, `${machineLabel(mid, true)} is offline. Sessions keep running there; this view reconnects automatically.`));
+        renderHeader();
+        break;
       case 'not_live':
-        if (S.mode === 'live' || S.mode === 'loading') {
+        if (S.mode === 'live' || S.mode === 'loading' || S.mode === 'offline') {
           S.mode = 'loading';
           loadStored();
         }
@@ -980,7 +1171,7 @@ function sessionView(id, cwdParam) {
       case 'permission':
         S.pending.set(msg.request.id, msg.request);
         renderPending();
-        if (document.hidden) notify('Claude needs approval', msg.request.title || msg.request.toolName, `/#/s/${id}`);
+        if (document.hidden) notify('Claude needs approval', msg.request.title || msg.request.toolName, `/${sessionHash(id, S.cwd)}`);
         break;
       case 'permission_resolved':
         S.pending.delete(msg.id);

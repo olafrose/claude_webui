@@ -139,9 +139,10 @@ export class LiveSession extends EventEmitter {
   #setStatus(status) {
     if (this.status === status) return;
     if (this.status === 'closed' || this.status === 'error') return;
+    const prev = this.status;
     this.status = status;
     this.#emit({ t: 'status', status });
-    this.emit('status', status);
+    this.emit('status', status, prev);
   }
 
   #upsertTask(id, patch) {
@@ -428,8 +429,12 @@ export class SessionManager extends EventEmitter {
     if (existing) this.sessions.delete(opts.resume);
     const s = new LiveSession(opts);
     this.sessions.set(s.sessionId, s);
-    s.on('status', () => this.emit('changed'));
+    s.on('status', (status, prev) => {
+      if (prev === 'running' && status === 'idle') this.emit('done', s);
+      this.emit('changed');
+    });
     s.on('attention', (req) => this.emit('attention', s, req));
+    s.on('event', (ev) => this.emit('session_event', s, ev));
     s.on('ended', () => {
       // Keep the object briefly so late viewers see the final state, then drop it.
       setTimeout(() => {

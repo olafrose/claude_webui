@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { listSessions } from '@anthropic-ai/claude-agent-sdk';
@@ -22,8 +23,11 @@ function isWithin(child, parent) {
 
 /** Ensure a path is BASE_DIR itself or a direct/indirect child of it; returns the resolved path. */
 export function resolveProjectPath(p) {
+  // Relative (or drive-relative "C:foo") paths would resolve against the agent's own cwd.
+  if (!p || !path.isAbsolute(p) || (isWin && /^[a-zA-Z]:(?![\\/])/.test(p))) throw Object.assign(new Error('An absolute project path is required'), { status: 400 });
   const resolved = path.resolve(p);
   if (!isWithin(resolved, config.baseDir)) throw Object.assign(new Error('Path is outside BASE_DIR'), { status: 400 });
+  if (!fsSync.existsSync(resolved) || !fsSync.statSync(resolved).isDirectory()) throw Object.assign(new Error('Project folder does not exist'), { status: 404 });
   return resolved;
 }
 

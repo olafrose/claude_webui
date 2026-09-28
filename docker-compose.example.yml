@@ -1,0 +1,23 @@
+# Example: run the hub next to Nginx Proxy Manager. Put it on the same Docker network as NPM
+# and point the NPM proxy host at http://claude-remote-hub:3456 (with Websockets Support on).
+services:
+  claude-remote-hub:
+    build: .
+    container_name: claude-remote-hub
+    restart: unless-stopped
+    environment:
+      APP_PASSWORD: ${APP_PASSWORD}
+      TOTP_SECRET: ${TOTP_SECRET:-}
+      PUBLIC_URL: https://claude.example.com
+    volumes:
+      - hub-data:/data
+    # No ports published: only NPM talks to the hub.
+    networks:
+      - npm
+
+volumes:
+  hub-data:
+
+networks:
+  npm:
+    external: true # the network your Nginx Proxy Manager container is on

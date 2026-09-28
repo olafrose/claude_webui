@@ -69,6 +69,11 @@ a { color: var(--accent); }
   border: 0; background: transparent; border-radius: 10px; cursor: pointer; flex: none;
 }
 .icon-btn:hover { background: var(--surface-2); }
+a.icon-btn { color: inherit; }
+.code-block { font-family: var(--mono); font-size: 12.5px; background: var(--code-bg); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; overflow-x: auto; white-space: pre; margin: 6px 0 10px; user-select: all; }
+.steps { padding-left: 20px; margin: 0 0 8px; font-size: 14px; }
+.steps li { margin-bottom: 6px; }
+.steps code { font-family: var(--mono); font-size: 13px; background: var(--code-bg); padding: 1px 5px; border-radius: 5px; }
 .icon-btn svg { width: 22px; height: 22px; }
 
 .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
