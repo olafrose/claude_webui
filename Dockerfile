@@ -7,6 +7,8 @@ RUN npm ci --omit=optional --omit=dev && npm cache clean --force
 COPY hub ./hub
 COPY public ./public
 COPY scripts ./scripts
+# Named volumes inherit this ownership, so the non-root user can write its data.
+RUN mkdir -p /data && chown node:node /data
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=3456 \
